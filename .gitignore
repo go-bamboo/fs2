@@ -6,3 +6,4 @@ vendor
 bptree.test
 *.png
 *.pprof
+.idea
