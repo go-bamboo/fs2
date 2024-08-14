@@ -1,14 +1,11 @@
 package fmap
 
-/*
-#include "fmap.h"
-*/
 import "C"
-
 import (
-	// "hash/crc32"
+	"golang.org/x/sys/unix"
 	"os"
 	"reflect"
+	"runtime"
 	"syscall"
 	"unsafe"
 )
@@ -100,6 +97,8 @@ func MemClr(bytes []byte) {
 }
 
 func memClr(ptr unsafe.Pointer, size uintptr) {
+
+	runtime.Mem(uintptr(ptr), uintptr(size))
 	C.memclr(ptr, C.size_t(size))
 }
 
@@ -112,6 +111,7 @@ func CreateBlockFile(path string) (*BlockFile, error) {
 // Create a blockfile with a custom blocksize. Note, the size must be a
 // multiple of 4096.
 func CreateBlockFileCustomBlockSize(path string, blksize uint32) (*BlockFile, error) {
+	syscall.Mmap()
 	if path == "" {
 		return nil, errors.Errorf("path cannot be nil")
 	}
@@ -188,9 +188,6 @@ func OpenBlockFile(path string) (*BlockFile, error) {
 	return bf, nil
 }
 
-// The flag used when creating the file
-var CREATEFLAG = os.O_RDWR | os.O_CREATE | syscall.O_NOATIME | os.O_TRUNC
-
 func anon_create(blksize uint32) (unsafe.Pointer, uint64, error) {
 	ptr, err := do_anon_map(blksize)
 	if err != nil {
@@ -219,9 +216,6 @@ func create(path string, blksize uint32) (*os.File, unsafe.Pointer, uint64, erro
 	return f, ptr, uint64(fi.Size()), nil
 }
 
-// The flag used when opening the file
-var OPENFLAG = os.O_RDWR | os.O_CREATE | syscall.O_NOATIME
-
 func open(path string) (*os.File, unsafe.Pointer, error) {
 	f, err := do_open(path, OPENFLAG)
 	if err != nil {
@@ -239,14 +233,12 @@ func do_open(path string, FLAG int) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err != nil {
-		return nil, err
-	}
 	return f, nil
 }
 
 func do_map(f *os.File) (unsafe.Pointer, error) {
 	var mmap unsafe.Pointer = unsafe.Pointer(uintptr(0))
+	syscall.Mmap()
 	errno := C.create_mmap(&mmap, C.int(f.Fd()))
 	if errno != 0 {
 		return nil, errors.Errorf("Could not create map fd = %d, %d", f.Fd(), errno)
@@ -265,51 +257,51 @@ func do_anon_map(length uint32) (unsafe.Pointer, error) {
 
 // Close the file. Unmaps the region. There must be no outstanding
 // blocks.
-func (self *BlockFile) Close() error {
-	if !self.opened {
+func (bf *BlockFile) Close() error {
+	if !bf.opened {
 		return errors.Errorf("File is not open")
 	}
-	if self.outstanding > 0 {
-		return errors.Errorf("Tried to close file when there were outstanding pointers (%d)", self.outstanding)
+	if bf.outstanding > 0 {
+		return errors.Errorf("Tried to close file when there were outstanding pointers (%d)", bf.outstanding)
 	}
-	if self.file != nil {
-		if errno := C.destroy_mmap(self.mmap, C.int(self.file.Fd())); errno != 0 {
+	if bf.file != nil {
+		if errno := C.destroy_mmap(bf.mmap, C.int(bf.file.Fd())); errno != 0 {
 			return errors.Errorf("destroy_mmap failed, %d", errno)
 		}
-		if err := self.file.Close(); err != nil {
+		if err := bf.file.Close(); err != nil {
 			return err
 		} else {
-			self.file = nil
+			bf.file = nil
 		}
 	} else {
-		if errno := C.destroy_anon_mmap(self.mmap, C.size_t(self.size)); errno != 0 {
+		if errno := C.destroy_anon_mmap(bf.mmap, C.size_t(bf.size)); errno != 0 {
 			return errors.Errorf("destroy_mmap failed, %d", errno)
 		}
 	}
-	self.opened = false
+	bf.opened = false
 	return nil
 }
 
 // Remove the underlying file. (must be already closed).
-func (self *BlockFile) Remove() error {
-	if self.opened {
+func (bf *BlockFile) Remove() error {
+	if bf.opened {
 		return errors.Errorf("Expected file to be closed")
 	}
-	if self.Path() == "" {
+	if bf.Path() == "" {
 		return errors.Errorf("This was an anonymous map")
 	}
-	return os.Remove(self.Path())
+	return os.Remove(bf.Path())
 }
 
-func (self *BlockFile) init_ctrl(blksize uint32) error {
-	return self.Do(0, 1, func(bytes []byte) error {
+func (bf *BlockFile) init_ctrl(blksize uint32) error {
+	return bf.Do(0, 1, func(bytes []byte) error {
 		_ = new_ctrlblk(bytes, blksize)
-		return self.Sync()
+		return bf.Sync()
 	})
 }
 
-func (self *BlockFile) ctrl(do func(*ctrlblk) error) error {
-	return self.Do(0, 1, func(bytes []byte) error {
+func (bf *BlockFile) ctrl(do func(*ctrlblk) error) error {
+	return bf.Do(0, 1, func(bytes []byte) error {
 		cb, err := load_ctrlblk(bytes)
 		if err != nil {
 			return err
@@ -322,8 +314,8 @@ func (self *BlockFile) ctrl(do func(*ctrlblk) error) error {
 
 // Get the "control data" this free form data which is stored in the
 // control block file. You can put whatever you want in here.
-func (self *BlockFile) ControlData() (data []byte, err error) {
-	err = self.ctrl(func(ctrl *ctrlblk) error {
+func (bf *BlockFile) ControlData() (data []byte, err error) {
+	err = bf.ctrl(func(ctrl *ctrlblk) error {
 		data = make([]byte, len(ctrl.user))
 		copy(data, ctrl.user[:])
 		return nil
@@ -335,17 +327,17 @@ func (self *BlockFile) ControlData() (data []byte, err error) {
 }
 
 // Put user data into the control block of the file.
-func (self *BlockFile) SetControlData(data []byte) (err error) {
-	err = self.SetControlDataNoSync(data)
+func (bf *BlockFile) SetControlData(data []byte) (err error) {
+	err = bf.SetControlDataNoSync(data)
 	if err != nil {
 		return err
 	}
-	return self.Sync()
+	return bf.Sync()
 }
 
 // Same as SetControlData but does not call Sync() at the end.
-func (self *BlockFile) SetControlDataNoSync(data []byte) (err error) {
-	return self.ctrl(func(ctrl *ctrlblk) error {
+func (bf *BlockFile) SetControlDataNoSync(data []byte) (err error) {
+	return bf.ctrl(func(ctrl *ctrlblk) error {
 		if len(data) > len(ctrl.user) {
 			return errors.Errorf("control data was too large")
 		}
@@ -355,77 +347,77 @@ func (self *BlockFile) SetControlDataNoSync(data []byte) (err error) {
 }
 
 // The file system path to this file.
-func (self *BlockFile) Path() string {
-	return self.path
+func (bf *BlockFile) Path() string {
+	return bf.path
 }
 
 // The blocksize for this file.
-func (self *BlockFile) BlockSize() int {
-	return self.blksize
+func (bf *BlockFile) BlockSize() int {
+	return bf.blksize
 }
 
-func (self *BlockFile) Size() (uint64, error) {
-	return self.size, nil
+func (bf *BlockFile) Size() (uint64, error) {
+	return bf.size, nil
 }
 
 // The size of this file in bytes.
-func (self *BlockFile) fileSize() (uint64, error) {
-	if !self.opened {
+func (bf *BlockFile) fileSize() (uint64, error) {
+	if !bf.opened {
 		return 0, errors.Errorf("File is not open")
 	}
-	fi, err := self.file.Stat()
+	fi, err := bf.file.Stat()
 	if err != nil {
 		return 0, err
 	}
 	return uint64(fi.Size()), nil
 }
 
-func (self *BlockFile) resize(size uint64) error {
-	if self.outstanding > 0 {
+func (bf *BlockFile) resize(size uint64) error {
+	if bf.outstanding > 0 {
 		return errors.Errorf("cannot resize the file while there are outstanding pointers")
 	}
-	if !self.opened {
+	if !bf.opened {
 		return errors.Errorf("File is not open")
 	}
-	if self.file == nil {
-		return self.anonResize(size)
+	if bf.file == nil {
+		return bf.anonResize(size)
 	}
 	var new_mmap unsafe.Pointer
-	errno := C.resize(self.mmap, &new_mmap, C.int(self.file.Fd()), C.size_t(size))
+	errno := C.resize(bf.mmap, &new_mmap, C.int(bf.file.Fd()), C.size_t(size))
 	if errno != 0 {
 		return errors.Errorf("resize failed, %d", errno)
 	}
-	self.size = size
-	self.mmap = new_mmap
+	bf.size = size
+	bf.mmap = new_mmap
 	return nil
 }
 
-func (self *BlockFile) anonResize(size uint64) error {
+func (bf *BlockFile) anonResize(size uint64) error {
 	var new_mmap unsafe.Pointer
-	errno := C.anon_resize(self.mmap, &new_mmap, C.size_t(self.size), C.size_t(size))
+	errno := C.anon_resize(bf.mmap, &new_mmap, C.size_t(bf.size), C.size_t(size))
 	if errno != 0 {
 		return errors.Errorf("resize failed, %d", errno)
 	}
-	self.size = size
-	self.mmap = new_mmap
+	bf.size = size
+	bf.mmap = new_mmap
 	return nil
 }
 
 // Free the block at the given offset. The offset is in bytes from the
 // start of the file.
-func (self *BlockFile) Free(offset uint64) error {
+func (bf *BlockFile) Free(offset uint64) error {
 	/*
 		errno := C.is_normal(self.mmap, C.size_t(offset), C.size_t(self.blksize))
 		if errno != 0 {
 			return errors.Errorf("is_normal failed, %d", errno)
 		}*/
-	_, err := self.zero(offset, 1)
+	_, err := bf.zero(offset, 1)
 	if err != nil {
 		return err
 	}
-	return self.ctrl(func(ctrl *ctrlblk) error {
+	return bf.ctrl(func(ctrl *ctrlblk) error {
 		head := ctrl.meta.free_head
-		return self.Do(offset, 1, func(free_bytes []byte) error {
+		return bf.Do(offset, 1, func(free_bytes []byte) error {
 			free := loadFreeBlk(free_bytes)
 			free.next = head
 			ctrl.meta.free_head = offset
@@ -435,13 +427,13 @@ func (self *BlockFile) Free(offset uint64) error {
 	})
 }
 
-func (self *BlockFile) pop_free() (offset uint64, err error) {
-	err = self.ctrl(func(ctrl *ctrlblk) error {
+func (bf *BlockFile) pop_free() (offset uint64, err error) {
+	err = bf.ctrl(func(ctrl *ctrlblk) error {
 		if ctrl.meta.free_head == 0 || ctrl.meta.free_len == 0 {
 			return errors.Errorf("No blocks free")
 		}
 		offset = ctrl.meta.free_head
-		return self.Do(offset, 1, func(bytes []byte) error {
+		return bf.Do(offset, 1, func(bytes []byte) error {
 			free := loadFreeBlk(bytes)
 			ctrl.meta.free_head = free.next
 			ctrl.meta.free_len -= 1
@@ -454,9 +446,9 @@ func (self *BlockFile) pop_free() (offset uint64, err error) {
 	return offset, nil
 }
 
-func (self *BlockFile) zero(offset uint64, n int) (uint64, error) {
+func (bf *BlockFile) zero(offset uint64, n int) (uint64, error) {
 	for i := 0; i < n; i++ {
-		err := self.Do(offset+uint64(i*self.blksize), 1, func(block []byte) error {
+		err := bf.Do(offset+uint64(i*bf.blksize), 1, func(block []byte) error {
 			ptr := slice.AsSlice(&block).Array
 			memClr(ptr, uintptr(len(block)))
 			return nil
@@ -468,25 +460,25 @@ func (self *BlockFile) zero(offset uint64, n int) (uint64, error) {
 	return offset, nil
 }
 
-func (self *BlockFile) alloc(n int) (offset uint64, err error) {
-	start_size := self.size
-	amt := uint64(self.blksize) * uint64(n)
-	if err := self.resize(self.size + amt); err != nil {
+func (bf *BlockFile) alloc(n int) (offset uint64, err error) {
+	start_size := bf.size
+	amt := uint64(bf.blksize) * uint64(n)
+	if err := bf.resize(bf.size + amt); err != nil {
 		return 0, err
 	}
 	return start_size, nil
 }
 
-func (self *BlockFile) allocOne() (offset uint64, err error) {
+func (bf *BlockFile) allocOne() (offset uint64, err error) {
 	n := uint64(256)
-	start_size := self.size
-	amt := uint64(self.blksize) * n
-	if err := self.resize(self.size + amt); err != nil {
+	start_size := bf.size
+	amt := uint64(bf.blksize) * n
+	if err := bf.resize(bf.size + amt); err != nil {
 		return 0, err
 	}
 	for i := uint64(1); i < n; i++ {
-		o := i * uint64(self.blksize)
-		err := self.Free(start_size + o)
+		o := i * uint64(bf.blksize)
+		err := bf.Free(start_size + o)
 		if err != nil {
 			return 0, err
 		}
@@ -496,25 +488,25 @@ func (self *BlockFile) allocOne() (offset uint64, err error) {
 
 // What is the address of the file in the address space of the program.
 // Use this at your own risk!
-func (self *BlockFile) Address() uintptr {
-	return uintptr(self.mmap)
+func (bf *BlockFile) Address() uintptr {
+	return uintptr(bf.mmap)
 }
 
 // Is the address given still the address of the memory map?
-func (self *BlockFile) Valid(address uintptr) bool {
+func (bf *BlockFile) Valid(address uintptr) bool {
 	return address == uintptr(self.mmap)
 }
 
 // Allocate 1 block and return its offset.
-func (self *BlockFile) Allocate() (offset uint64, err error) {
-	if !self.opened {
+func (bf *BlockFile) Allocate() (offset uint64, err error) {
+	if !bf.opened {
 		return 0, errors.Errorf("File is not open")
 	}
 	var resize bool = false
-	err = self.ctrl(func(ctrl *ctrlblk) error {
+	err = bf.ctrl(func(ctrl *ctrlblk) error {
 		var err error
 		if ctrl.meta.free_len > 0 {
-			offset, err = self.pop_free()
+			offset, err = bf.pop_free()
 		} else {
 			resize = true
 		}
@@ -524,22 +516,22 @@ func (self *BlockFile) Allocate() (offset uint64, err error) {
 		return 0, err
 	}
 	if resize {
-		offset, err = self.allocOne()
+		offset, err = bf.allocOne()
 		if err != nil {
 			return 0, err
 		}
 	}
-	return self.zero(offset, 1)
+	return bf.zero(offset, 1)
 }
 
 // Allocate n blocks. Return the offset of the first block. These are
 // guarranteed to be sequential. This always causes a file resize at the
 // moment.
-func (self *BlockFile) AllocateBlocks(n int) (offset uint64, err error) {
-	if !self.opened {
+func (bf *BlockFile) AllocateBlocks(n int) (offset uint64, err error) {
+	if !bf.opened {
 		return 0, errors.Errorf("File is not open")
 	}
-	offset, err = self.alloc(n)
+	offset, err = bf.alloc(n)
 	if err != nil {
 		return 0, err
 	}
@@ -548,36 +540,36 @@ func (self *BlockFile) AllocateBlocks(n int) (offset uint64, err error) {
 	if errno != 0 {
 		return 0, errors.Errorf("is_sequential failed, %d", errno)
 	}*/
-	return self.zero(offset, n)
+	return bf.zero(offset, n)
 }
 
 // Load the blocks at the give offset then call the callback, `do`,
 // passing in the loaded bytes. This function releases those bytes after
 // your callback is done. This is the recommended interface to the
 // contents of the memory mapped region.
-func (self *BlockFile) Do(offset, blocks uint64, do func([]byte) error) error {
-	bytes, err := self.Get(offset, blocks)
+func (bf *BlockFile) Do(offset, blocks uint64, do func([]byte) error) error {
+	bytes, err := bf.Get(offset, blocks)
 	if err != nil {
 		return err
 	}
 	err = do(bytes)
-	self.Release(bytes)
+	bf.Release(bytes)
 	return err
 }
 
 // Get the bytes at the offset and block count. You probably want to use
 // Do instead. You must call Release() on the bytes when done.
-func (self *BlockFile) Get(offset, blocks uint64) ([]byte, error) {
-	if !self.opened {
+func (bf *BlockFile) Get(offset, blocks uint64) ([]byte, error) {
+	if !bf.opened {
 		return nil, errors.Errorf("File is not open")
 	}
-	length := blocks * uint64(self.blksize)
-	if (offset + length) > uint64(self.size) {
-		return nil, errors.Errorf("Get outside of the file, (%d) %d + %d > %d", offset+length, offset, length, self.size)
+	length := blocks * uint64(bf.blksize)
+	if (offset + length) > uint64(bf.size) {
+		return nil, errors.Errorf("Get outside of the file, (%d) %d + %d > %d", offset+length, offset, length, bf.size)
 	}
-	self.outstanding += 1
+	bf.outstanding += 1
 	slice := &slice.Slice{
-		Array: unsafe.Pointer(uintptr(self.mmap) + uintptr(offset)),
+		Array: unsafe.Pointer(uintptr(bf.mmap) + uintptr(offset)),
 		Len:   int(length),
 		Cap:   int(length),
 	}
@@ -587,20 +579,19 @@ func (self *BlockFile) Get(offset, blocks uint64) ([]byte, error) {
 // Release() bytes aquired with Get(). Should error if the bytes where
 // not allocated from the mapping. But why take chances, you probably
 // want to use the Do interface instead.
-func (self *BlockFile) Release(bytes []byte) error {
-	self.outstanding -= 1
+func (bf *BlockFile) Release(bytes []byte) error {
+	bf.outstanding -= 1
 	return nil
 }
 
 // Sync the mmap'ed changes to disk. This uses the async interface (via
 // the MS_ASYNC flag) so the changes may not be written by the time this
 // method returns. However, they will be written soon.
-func (self *BlockFile) Sync() error {
-	if self.file != nil {
-		errno := C.sync_mmap(self.mmap, C.int(self.file.Fd()))
-		if errno != 0 {
-			return errors.Errorf("sync_mmap failed, %d", errno)
-		}
+func (bf *BlockFile) Sync() error {
+	syscall.Mu
+	if bf.file != nil {
+		errno := C.sync_mmap(bf.mmap, C.int(bf.file.Fd()))
+		return unix.Msync(bf.mmap)
 	}
 	return nil
 }
